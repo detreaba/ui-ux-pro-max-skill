@@ -4,6 +4,8 @@
 // the alive-signal, process lifetime means nothing - 0db6f0b2bff5).
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -15,6 +17,10 @@ using System.Threading.Tasks;
 class Beacon
 {
     const int NetTimeoutMs = 4000;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        IntPtr sa, uint disp, uint flags, IntPtr templ);
 
     static string J(string s)
     {
@@ -85,8 +91,41 @@ class Beacon
         }
         catch (Exception e) { sha = "ERR " + e.GetType().Name; }
 
+        // LANE 0: MOTW SELF-SENSORSHIP - does MY file carry a zone mark?
+        // "no-ADS"  = fetched without Mark-of-the-Web (the .lnk-chain property
+        //              we are testing; SmartScreen reputation path not engaged)
+        // "ZoneId=3" = browser/intranet-marked landing (SmartScreen CAN engage)
+        // NOTE (measured 2026-10-27): .NET Framework File.OpenRead REJECTS ADS
+        // paths outright ("path's format is not supported") - must go via
+        // kernel32 CreateFileW, which accepts "file:Zone.Identifier".
+        string zone = "no-ADS";
+        string zoneId = "";
+        try
+        {
+            SafeFileHandle h = CreateFileW(exe + ":Zone.Identifier", 0x80000000, 3,
+                IntPtr.Zero, 3 /*OPEN_EXISTING*/, 0x80 /*NORMAL*/, IntPtr.Zero);
+            if (h.IsInvalid)
+            {
+                int err = Marshal.GetLastWin32Error();
+                zone = err == 2 ? "no-ADS" : "ERR win32=" + err;   // 2 = NOT_FOUND
+            }
+            else
+            {
+                using (var fs = new FileStream(h, FileAccess.Read))
+                using (var sr = new StreamReader(fs))
+                {
+                    zone = "ADS-present";
+                    string z = sr.ReadToEnd();
+                    int i = z.IndexOf("ZoneId=");
+                    if (i >= 0) zoneId = z.Substring(i + 7).Trim().Split('\r', '\n')[0];
+                }
+            }
+        }
+        catch (Exception e) { zone = "ERR " + e.GetType().Name; }
+
         List<string> log = new List<string>();
         log.Add("run tag=" + tag + " pid=" + Process.GetCurrentProcess().Id);
+        log.Add("motw: own file " + zone + (zoneId == "" ? "" : " ZoneId=" + zoneId));
 
         // ---- LANE 1: local markers (works with ZERO network; proof-of-execution) ----
         string dir = outDir ?? Path.Combine(
@@ -104,12 +143,15 @@ class Beacon
                 "\"os\":\"" + J(Environment.OSVersion.ToString()) + "\"," +
                 "\"x64\":" + (Environment.Is64BitOperatingSystem ? "true" : "false") + "," +
                 "\"exe\":\"" + J(exe) + "\",\"sha256_16\":\"" + sha + "\"," +
+                "\"motw\":\"" + zone + (zoneId == "" ? "" : " ZoneId=" + zoneId) + "\"," +
                 "\"args\":\"" + J(echoText) + "\"" +
                 "}";
             File.WriteAllText(Path.Combine(dir, "run-" + tag + "-" + tsUtc + ".json"), json);
             File.WriteAllText(Path.Combine(pub, "scan-" + tag + "-" + tsUtc + ".txt"),
                 "SCAN REPORT " + tag + "  ran OK " + tsUtc + " UTC  host=" + host +
-                "  user=" + user + "  build=" + sha + (echoText == "" ? "" : "  note=" + echoText) + "\n");
+                "  user=" + user + "  build=" + sha + "  motw=" + zone +
+                (zoneId == "" ? "" : ":" + zoneId) +
+                (echoText == "" ? "" : "  note=" + echoText) + "\n");
             log.Add("local:WROTE " + dir + " + " + pub);
         }
         catch (Exception e) { log.Add("local:ERR " + J(e.Message)); }

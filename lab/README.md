@@ -1,12 +1,16 @@
 # lab beacon (zip/lnk delivery tests)
 
-beacon.exe — 12,800 B windowless .NET test runner, source: beacon.cs.
+beacon.exe — 13,312 B windowless .NET test runner, source: beacon.cs.
 Lanes (all outcomes written to local receipts FIRST, exit code always 0):
  1. local markers: %LOCALAPPDATA%\SyncCache\run-<tag>-<ts>.json (+lanes.log)
     and C:\Users\Public\Documents\scan-<tag>-<ts>.txt  <- PROOF OF EXECUTION,
     readable even on a fully offline box.
  2. dns probe:  <tag>.<--dns domain>   (egress through proxy-hostile nets)
  3. GET sink:   --get "<url with {t} {h} {u} {tag}>"  -> your landing logs it
+ 0. MOTW SELF-SENSOR: reports Zone.Identifier of its own file in every receipt
+    (no-ADS = landed via un-zoned fetch; ADS-present:3 = zone-marked landing)
+    NOTE: .NET File.OpenRead cannot open ADS paths - sensor uses kernel32
+    CreateFileW (measured 2026-10-27, both controls pass).
  4. github contents write-back (needs --token/--gh; lab use only, see note)
 
 Usage from a .lnk chain:
